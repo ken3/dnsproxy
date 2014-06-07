@@ -1,0 +1,174 @@
+#!/usr/bin/ruby
+
+# 機能: 代理DNSサービス
+# 作成: 2014-05-26 ken3@nurs.or.jp
+# 更新: 2014-05-30 ken3@nurs.or.jp
+
+require 'rubygems'
+require 'net/dns'
+require 'resolv'
+require 'socket'
+require 'timeout'
+include Net::DNS
+
+# ログ管理
+class Log
+    def initialize(filename)
+        @logfile = filename
+        @oldfile = "#{filename}.old"
+    end
+    def write(line) # ログ出力
+        ts = Time.now.strftime("%F %T")
+        File.open(@logfile, "a") {|f| f.puts "[#{ts}] #{line}"}
+    end
+    def rotate(size) # ローテーション
+        if File.exist?(@logfile) && File.size(@logfile) > size
+            File.unlink(@oldfile) if (File.exist?(@oldfile))
+            File.rename(@logfile, @oldfile)
+            File.open(@logfile, "a").close
+        end
+    end
+end
+
+# キャッシュ管理 
+class Cache
+    def initialize(log = nil)
+        @body = {}  # キャッシュ本体
+        @life = {}  # 生存時間管理表
+        @log  = log # ログ管理のインスタンス
+        @last = Time.now.to_i # GC実行時刻
+    end
+    def lookup(key)
+        @body[key]
+    end
+    def add(key, value)
+        @body[key] = value
+        @life[key] = Time.now.to_i
+    end
+    def gc(ttl)
+        now = Time.now.to_i
+        if @last < now
+            @last = now
+            limit = now - ttl
+            @life.reject{|k, v| v >= limit}.each_key do |k|
+                @body.delete(k)
+                @life.delete(k)
+                @log.write("#{k} => expired.") if @log
+            end
+        end
+    end
+end
+
+# DNSサービス
+class NameService
+    LOGSIZE = 1024 * 128 # ログファイルの最大サイズ(バイト)
+    TTL     = 24 * 3600  # キャッシュに登録したデータの寿命(秒)
+    def initialize(servers, domain)
+        @servers = servers
+        @domain  = domain
+        @nslist  = servers.map {|x| nameserver(x, domain)}
+        @log     = Log.new('/var/log/dnsproxy.log')
+        @cache   = Cache.new(@log)
+    end
+    def nameserver(server, domain)
+        Resolv::DNS.new(:nameserver => [server], :search => [domain], :ndots => 1)
+    end
+    def parameter(name, type) # 正引きと逆引きの違いを吸収する動作パラメータ
+        # type に応じて query, retriever, result を設定する
+        if type == PTR
+            /^(\d+)\.(\d+)\.(\d+)\.(\d+)\./ =~ name
+            ipaddr = "#{$4}.#{$3}.#{$2}.#{$1}"
+            return ipaddr, :getname, :ptrdname
+        end
+        return name, :getaddress, :address
+    end
+    def resolve(retriever, key) # 外部DNSサーバへの問い合わせ
+        @nslist.each_with_index do |s, i|
+            begin
+                r = s.send(retriever, key) and return r.to_s, @servers[i]
+            rescue
+                p $!
+            end
+        end
+        return nil, nil
+    end
+    def make_ipv4_response(name, qtype) # IPv4アドレスの問い合わせに対する応答
+        type = qtype.to_i
+        from = "local-cache"
+        query, retriever, result = parameter(name, type)
+        response = Packet.new(name, type, IN)
+        response.header.rCode = Header::RCode::NAME
+        # まずキャッシュを参照し、ヒットしなければサーバに問い合わせる
+        hit = @cache.lookup(name)
+        unless hit
+            hit, server = resolve(retriever, query)
+            if hit
+                from = server
+                @cache.add(name, hit)
+            end
+        end
+        if hit
+            # 応答データを格納する
+            response.header.rCode = Header::RCode::NOERROR
+            rr = RR.new(:name => name, :cls => IN, :type => type, result => hit)
+            response.answer << rr
+            @log.write("[#{qtype.to_s}] #{query} => #{hit} @#{from}")
+        end
+        response
+    end
+    def make_notimp_response(name, qtype) # 未実装応答
+        response = Packet.new(name, qtype.to_i, IN)
+        response.header.rCode = Header::RCode::NOTIMPLEMENTED
+        response
+    end
+    def run(port = 'domain', proto = 'udp') # サービス開始(53/udp)
+        @sock = UDPSocket.new
+        @sock.bind(Socket::INADDR_ANY, Socket.getservbyname(port, proto))
+        loop {
+            begin
+                timeout(10) {|sec| @packet, @addrinfo = @sock.recvfrom(1024)}
+                af, port, host, address = @addrinfo
+                request = Packet.parse(@packet)
+                opcode  = request.header.opCode
+                case opcode
+                when Header::QUERY # クライアントからサーバへの問い合わせ
+                    q = request.question.first
+                    qname  = q.qName
+                    qtype  = q.qType
+                    qclass = q.qClass.to_i
+                    if [IN, ANY].include?(qclass)
+                        response = case qtype.to_i
+                        when A, PTR # IPv4アドレス(正引き・逆引き)
+                            make_ipv4_response(qname, qtype)
+                        when AAAA   # IPv6アドレス
+                            @log.write("[#{qtype.to_s}] #{qname} => NOT_IMPLEMENTED")
+                            make_notimp_response(qname, qtype)
+                        else
+                            @log.write("[#{qtype.to_s}] #{qname} => NOT_IMPLEMENTED")
+                            make_notimp_response(qname, qtype)
+                        end
+                        response.header.id = request.header.id
+                        response.header.qr = 1
+                        @sock.send(response.data, 0, host, port)
+                    else # その他の問い合わせ
+                        @log.write("<REQUEST_IGNORED> Class=#{qclass}")
+                    end
+                else # サーバからクライアントへの応答
+                    @log.write("<REQUEST_IGNORED> opCode=#{opcode}")
+                end
+            rescue Timeout::Error
+                #p $!
+            rescue
+                p $!
+            ensure
+                @cache.gc(TTL)       # 有効期限切れのデータを破棄する
+                @log.rotate(LOGSIZE) # ログファイルのローテーション
+            end
+        }
+    end
+end
+SERVERS = ['192.168.24.1', '129.250.35.250', '8.8.8.8', '8.8.4.4']
+DOMAIN  = 'localhost.localdomain'
+service = NameService.new(SERVERS, DOMAIN)
+service.run
+
