@@ -2,7 +2,7 @@
 
 # 機能: 代理DNSサービス
 # 作成: 2014-05-26 ken3@nurs.or.jp
-# 更新: 2014-05-30 ken3@nurs.or.jp
+# 更新: 2014-06-08 ken3@nurs.or.jp
 
 require 'rubygems'
 require 'net/dns'
@@ -63,15 +63,18 @@ end
 class NameService
     LOGSIZE = 1024 * 128 # ログファイルの最大サイズ(バイト)
     TTL     = 24 * 3600  # キャッシュに登録したデータの寿命(秒)
-    def initialize(servers, domain)
-        @servers = servers
-        @domain  = domain
-        @nslist  = servers.map {|x| nameserver(x, domain)}
+    def initialize(servers)
+        @servers = servers.inject([]) {|r, x| r.push x[:server]}
+        @nslist  = servers.inject([]) {|r, x| r.push nameserver(x[:server], x[:domain])}
         @log     = Log.new('/var/log/dnsproxy.log')
         @cache   = Cache.new(@log)
     end
     def nameserver(server, domain)
-        Resolv::DNS.new(:nameserver => [server], :search => [domain], :ndots => 1)
+        if domain.nil?
+            Resolv::DNS.new(:nameserver => [server], :ndots => 1)
+        else
+            Resolv::DNS.new(:nameserver => [server], :search => [domain], :ndots => 1)
+        end
     end
     def parameter(name, type) # 正引きと逆引きの違いを吸収する動作パラメータ
         # type に応じて query, retriever, result を設定する
@@ -167,8 +170,12 @@ class NameService
         }
     end
 end
-SERVERS = ['192.168.24.1', '129.250.35.250', '8.8.8.8', '8.8.4.4']
-DOMAIN  = 'localhost.localdomain'
-service = NameService.new(SERVERS, DOMAIN)
+DNSSERVERS  = [
+    {:server => '192.168.24.1',   :domain => 'local.domain'},
+    {:server => '129.250.35.250', :domain => nil},
+    {:server => '8.8.8.8',        :domain => nil},
+    {:server => '8.8.4.4',        :domain => nil}
+]
+service = NameService.new(DNSSERVERS)
 service.run
 
